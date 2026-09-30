@@ -1,0 +1,126 @@
+SET NOCOUNT ON;
+
+/* ================== PARAMÈTRES À MODIFIER ================== */
+DECLARE @SchemaName      sysname       = N'dbo';
+DECLARE @TableName       sysname       = N'MaTable';
+DECLARE @Where           nvarchar(max) = N'1 = 1';           -- ex : N'Id > 100 AND Statut = ''A'''
+DECLARE @OrderBy         nvarchar(max) = N'(SELECT NULL)';   -- ex : N'Id ASC'
+DECLARE @IncludeIdentity bit           = 1;                  -- 1 = conserve les valeurs IDENTITY
+DECLARE @WrapInTran      bit           = 1;                  -- 1 = BEGIN TRAN / COMMIT autour des INSERT
+DECLARE @TargetTable     nvarchar(400) = NULL;               -- NULL = même nom ; ex : N'[dbo].[MaTable_Copie]'
+/* =========================================================== */
+
+DECLARE @FullName nvarchar(400) = QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName);
+DECLARE @ObjectId int           = OBJECT_ID(@FullName, N'U');
+
+IF @ObjectId IS NULL
+BEGIN
+    RAISERROR(N'Table %s introuvable.', 16, 1, @FullName);
+    RETURN;
+END;
+
+SET @TargetTable = ISNULL(@TargetTable, @FullName);
+
+DECLARE @HasIdentity bit =
+    CASE WHEN EXISTS (SELECT 1 FROM sys.columns WHERE object_id = @ObjectId AND is_identity = 1)
+         THEN 1 ELSE 0 END;
+
+/* ---------- Gabarits de formatage par type ----------
+   Convention : " représente ' (évite l'enfer des quotes imbriquées)
+                {c} = nom de colonne, {t} = nom du type                       */
+DECLARE @tUni   nvarchar(max) = N'ISNULL(N"N""" + REPLACE(CONVERT(nvarchar(max), {c}), N"""", N"""""") + N"""", N"NULL")';
+DECLARE @tStr   nvarchar(max) = N'ISNULL(N"""" + REPLACE(CONVERT(nvarchar(max), {c}), N"""", N"""""") + N"""", N"NULL")';
+DECLARE @tDate  nvarchar(max) = N'ISNULL(N"""" + CONVERT(nvarchar(40), {c}, 126) + N"""", N"NULL")';
+DECLARE @tNum   nvarchar(max) = N'ISNULL(CONVERT(nvarchar(50), {c}), N"NULL")';
+DECLARE @tMoney nvarchar(max) = N'ISNULL(CONVERT(nvarchar(50), {c}, 2), N"NULL")';
+DECLARE @tFloat nvarchar(max) = N'ISNULL(CONVERT(nvarchar(50), {c}, 3), N"NULL")';
+DECLARE @tReal  nvarchar(max) = N'ISNULL(CONVERT(nvarchar(50), {c}, 1), N"NULL")';
+DECLARE @tGuid  nvarchar(max) = N'ISNULL(N"""" + CONVERT(nvarchar(36), {c}) + N"""", N"NULL")';
+DECLARE @tBin   nvarchar(max) = N'ISNULL(CONVERT(nvarchar(max), CONVERT(varbinary(max), {c}), 1), N"NULL")';
+DECLARE @tHid   nvarchar(max) = N'ISNULL(N"""" + CAST({c} AS nvarchar(4000)) + N"""", N"NULL")';
+DECLARE @tGeo   nvarchar(max) = N'CASE WHEN {c} IS NULL THEN N"NULL" ELSE N"{t}::STGeomFromText(N""" + {c}.STAsText() + N""", " + CAST({c}.STSrid AS nvarchar(10)) + N")" END';
+
+/* ---------- Métadonnées des colonnes ---------- */
+DECLARE @Cols TABLE (column_id int, Q nvarchar(300), TypeName sysname, Expr nvarchar(max));
+
+INSERT INTO @Cols (column_id, Q, TypeName)
+SELECT c.column_id, QUOTENAME(c.name), LOWER(t.name)
+FROM sys.columns c
+JOIN sys.types   t ON t.user_type_id = CASE WHEN c.system_type_id = 240      -- types CLR
+                                            THEN c.user_type_id
+                                            ELSE c.system_type_id END
+WHERE c.object_id = @ObjectId
+  AND c.is_computed = 0
+  AND c.generated_always_type = 0            -- exclut les colonnes temporelles GENERATED ALWAYS
+  AND LOWER(t.name) <> N'timestamp'          -- rowversion : non insérable
+  AND (c.is_identity = 0 OR @IncludeIdentity = 1);
+
+UPDATE @Cols
+SET Expr = REPLACE(REPLACE(REPLACE(
+        CASE
+            WHEN TypeName IN (N'nchar', N'nvarchar', N'ntext', N'xml', N'sql_variant')                                  THEN @tUni
+            WHEN TypeName IN (N'char', N'varchar', N'text')                                                             THEN @tStr
+            WHEN TypeName IN (N'date', N'datetime', N'datetime2', N'smalldatetime', N'time', N'datetimeoffset')         THEN @tDate
+            WHEN TypeName IN (N'bit', N'tinyint', N'smallint', N'int', N'bigint', N'decimal', N'numeric')               THEN @tNum
+            WHEN TypeName IN (N'money', N'smallmoney')                                                                  THEN @tMoney
+            WHEN TypeName = N'float'                                                                                    THEN @tFloat
+            WHEN TypeName = N'real'                                                                                     THEN @tReal
+            WHEN TypeName = N'uniqueidentifier'                                                                         THEN @tGuid
+            WHEN TypeName IN (N'binary', N'varbinary', N'image')                                                        THEN @tBin
+            WHEN TypeName = N'hierarchyid'                                                                              THEN @tHid
+            WHEN TypeName IN (N'geography', N'geometry')                                                                THEN @tGeo
+            ELSE NULL
+        END, N'"', N''''), N'{c}', Q), N'{t}', TypeName);
+
+IF EXISTS (SELECT 1 FROM @Cols WHERE Expr IS NULL)
+BEGIN
+    DECLARE @Bad nvarchar(max) = (SELECT STRING_AGG(Q + N' (' + TypeName + N')', N', ') FROM @Cols WHERE Expr IS NULL);
+    RAISERROR(N'Type(s) non géré(s) : %s', 16, 1, @Bad);
+    RETURN;
+END;
+
+/* ---------- Listes de colonnes et de valeurs ---------- */
+DECLARE @Sep     nvarchar(20)  = REPLACE(N' + N", " + ', N'"', N'''');   -- donne :  + N', ' +
+DECLARE @ColList nvarchar(max), @ValList nvarchar(max);
+
+SELECT @ColList = STRING_AGG(CAST(Q    AS nvarchar(max)), N', ') WITHIN GROUP (ORDER BY column_id),
+       @ValList = STRING_AGG(CAST(Expr AS nvarchar(max)), @Sep)  WITHIN GROUP (ORDER BY column_id)
+FROM @Cols;
+
+IF @ColList IS NULL
+BEGIN
+    RAISERROR(N'Aucune colonne insérable pour %s.', 16, 1, @FullName);
+    RETURN;
+END;
+
+/* ---------- Génération ---------- */
+CREATE TABLE #Out (Id int IDENTITY(1,1) PRIMARY KEY, Stmt nvarchar(max) NOT NULL);
+
+DECLARE @UseIdInsert bit = CASE WHEN @IncludeIdentity = 1 AND @HasIdentity = 1 THEN 1 ELSE 0 END;
+
+-- En-tête
+INSERT INTO #Out (Stmt) VALUES (N'-- Source : ' + @FullName + N' | Cible : ' + @TargetTable);
+IF @WrapInTran = 1 INSERT INTO #Out (Stmt) VALUES (N'SET XACT_ABORT ON;'), (N'BEGIN TRANSACTION;');
+IF @UseIdInsert = 1 INSERT INTO #Out (Stmt) VALUES (N'SET IDENTITY_INSERT ' + @TargetTable + N' ON;');
+
+-- Corps : une ligne = un INSERT
+DECLARE @Sql nvarchar(max) =
+      N'INSERT INTO #Out (Stmt) SELECT N''INSERT INTO ' + REPLACE(@TargetTable, N'''', N'''''')
+    + N' (' + REPLACE(@ColList, N'''', N'''''') + N') VALUES ('' + '
+    + @ValList
+    + N' + N'');'' FROM ' + @FullName
+    + N' WHERE ' + ISNULL(NULLIF(@Where, N''), N'1 = 1')
+    + N' ORDER BY ' + ISNULL(NULLIF(@OrderBy, N''), N'(SELECT NULL)') + N';';
+
+-- PRINT @Sql;   -- décommenter pour voir le SQL dynamique généré
+EXEC sys.sp_executesql @Sql;
+DECLARE @Rows int = @@ROWCOUNT;
+
+-- Pied de page
+IF @UseIdInsert = 1 INSERT INTO #Out (Stmt) VALUES (N'SET IDENTITY_INSERT ' + @TargetTable + N' OFF;');
+IF @WrapInTran  = 1 INSERT INTO #Out (Stmt) VALUES (N'COMMIT TRANSACTION;');
+INSERT INTO #Out (Stmt) VALUES (N'-- ' + CAST(@Rows AS nvarchar(20)) + N' ligne(s) générée(s)');
+
+SELECT Stmt FROM #Out ORDER BY Id;
+
+DROP TABLE #Out;
